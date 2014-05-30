@@ -11,13 +11,13 @@ import traceback
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-class MutationWrapper:
+class MutCallerWrapper:
     def __init__(self, args):
         self.args = args
 
     def getTemplateDict(self):
         return dict(
-            BASE_DIR=BASE_DIR,
+            TOOL_DIR=os.path.join(BASE_DIR, "tools"),
             NORMAL_BAM=self.args.normal,
             TUMOR_BAM=self.args.tumor,
             COSMIC_VCF=self.args.cosmic_vcf,
@@ -35,10 +35,12 @@ class MutationWrapper:
 
         for cmd in self.run_map(params):
             print "Running CMD", cmd
+            subprocess.check_call(cmd, shell=True, cwd=params['OUT_DIR']) 
 
         cmd = self.run_reduce(params)
         if cmd is not None:
             print "Running CMD", cmd
+            subprocess.check_call(cmd, shell=True, cwd=params['OUT_DIR']) 
 
     def run_map(self, params):
         raise Exception("Implement a command line generator for calculations here")
@@ -48,9 +50,13 @@ class MutationWrapper:
 
 
 
-class Mutect(MutationWrapper):
+class Mutect(MutCallerWrapper):
     def run_map(self,params):
-        template = """java -jar ${BASE_DIR}/muTect-1.1.4.jar
+        
+        if params['COSMIC_VCF'] is None:
+            raise Exception("Missing COSMIC VCF")
+        
+        template = """java -jar ${TOOL_DIR}/muTect-1.1.4.jar
 --analysis_type MuTect
 --reference_sequence ${REF_SEQ}
 --cosmic ${COSMIC_VCF}
@@ -67,11 +73,27 @@ class Mutect(MutationWrapper):
     #    return None
 
     def check(self, params):
-        if not os.path.exists(os.path.join(params['BASE_DIR'], "muTect-1.1.4.jar")):
+        if not os.path.exists(os.path.join(params['TOOL_DIR'], "MuSEv0.9.8.6")):
+            raise Exception("Can't find MuSEv0.9.8.6")
+
+
+class Muse(MutCallerWrapper):
+    
+    def check(self, params):
+        if not os.path.exists(os.path.join(params['TOOL_DIR'], "muTect-1.1.4.jar")):
             raise Exception("Can't find muTect-1.1.4.jar")
+    
+    def run_map(self, params):
+        template = "${TOOL_DIR}/MuSEv0.9.8.6 call -P MuSEv0.9.8.6 -p 0.05 -b 0.0001 -B -f ${REF_SEQ} ${TUMOR_BAM} ${NORMAL_BAM}"
+        cmd = string.Template(template).substitute( params )
+        yield cmd
+    
+    def run_reduce(self,params):
+        return None
 
 method_callers = {
-    'mutect' : Mutect
+    'mutect' : Mutect,
+    'muse' : Muse
 }
 
 
@@ -87,7 +109,6 @@ if __name__ == "__main__":
     parser.add_argument("--refseq")
     parser.add_argument("--outdir", default="out")
     parser.add_argument("--clean-on-fail", action="store_true", default=False)
-
     args = parser.parse_args()
 
     if os.path.exists(args.outdir):
