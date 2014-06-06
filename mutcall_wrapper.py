@@ -9,15 +9,36 @@ import string
 import shutil
 import traceback
 from multiprocessing import Pool
+import vcf
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 def cmd_caller(i):
-    ar, cwd = i
+    block, ar, cwd = i
     cmd, out = ar
-    print "Running CMD", cmd
-    #subprocess.check_call(cmd, shell=True, cwd=cwd) 
+    if isinstance(cmd,basestring):
+        #print "Running CMD", cmd
+        p = subprocess.Popen(cmd, shell=True, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE) 
+        stdout, stderr = p.communicate()
+        if p.returncode != 0:
+            with open(os.path.join(cwd, "%s.error" % (block)), "w") as handle:
+                handle.write(stderr)
+    else:
+        cmd(block)
     return out
+
+
+def fai_chunk(path, blocksize):
+    seq_map = {}
+    with open( path ) as handle:
+        for line in handle:
+            tmp = line.split("\t")
+            seq_map[tmp[0]] = long(tmp[1])
+    
+    for seq in seq_map:
+        l = seq_map[seq]
+        for i in xrange(1, l, blocksize):
+            yield (seq, i, min(i+blocksize-1, l)) 
 
 class MutCallerWrapper:
     def __init__(self, args):
@@ -43,13 +64,16 @@ class MutCallerWrapper:
         self.check(params)
 
         p = Pool(self.args.cpus)
-        values = p.map(cmd_caller, list( (a, params['OUT_DIR']) for a in self.run_map(params) ))
+        values = p.map(cmd_caller, list( (i, a, params['OUT_DIR']) for i, a in enumerate(self.run_map(params)) ), 1)
     
         cmd = self.run_reduce(params, values)
         if cmd is not None:
-            print "Running CMD", cmd
-            #subprocess.check_call(cmd, shell=True, cwd=params['OUT_DIR']) 
-
+            if isinstance(cmd,basestring):
+                print "Running CMD", cmd
+                subprocess.check_call(cmd, shell=True, cwd=params['OUT_DIR']) 
+            else:
+                cmd(params)
+                
     def run_map(self, params):
         raise Exception("Implement a command line generator for calculations here")
 
@@ -61,25 +85,39 @@ class MutCallerWrapper:
 class Mutect(MutCallerWrapper):
     def run_map(self,params):
         
-        template = """java -jar ${TOOL_DIR}/muTect-1.1.4.jar \
+        template = """java -Xmx4g -XX:ParallelGCThreads=2 -jar ${TOOL_DIR}/muTect-1.1.5.jar \
 --analysis_type MuTect \
+--intervals ${INTERVAL} \
 --reference_sequence ${REF_SEQ} \
 --cosmic ${COSMIC_VCF} \
 --dbsnp ${DBSNP_VCF} \
 --input_file:normal ${NORMAL_BAM} \
 --input_file:tumor ${TUMOR_BAM} \
---out ${OUT_DIR}/stats.txt \
---coverage_file ${OUT_DIR}/coverage.txt
-"""
-        cmd = string.Template(template).substitute( params )
-        yield cmd, None
+--out ${OUT_DIR}/stats.${BLOCK_NUM}.txt \
+--coverage_file ${OUT_DIR}/coverage.${BLOCK_NUM}.txt \
+--vcf ${OUT_DIR}/out.${BLOCK_NUM}.vcf"""
+        for i, block in enumerate(fai_chunk( params['REF_SEQ'] + ".fai", params['BLOCK_SIZE'] ) ):
+            if block[0] != "hs37d5":
+                cmd = string.Template(template).substitute( dict(params, BLOCK_NUM=i, INTERVAL="%s:%s-%s" % (block[0], block[1], block[2]) ) )
+                yield cmd, "%s/out.%s.vcf" % (params['OUT_DIR'], i)
 
-    #def run_reduce(self,params):
-    #    return None
+    def run_reduce(self,params, values):
+        print "Reduce:", values
+        
+        def r(block):
+            vcf_writer = None
+            for a in values:
+                vcf_reader = vcf.Reader(filename=a)
+                if vcf_writer is None:
+                    vcf_writer = vcf.Writer(open(os.path.join(params['OUT_DIR'], "out.MuTect.vcf"), "w"), vcf_reader)
+                for record in vcf_reader:
+                    vcf_writer.write_record(record)                   
+        return r
+
 
     def check(self, params):
-        if not os.path.exists(os.path.join(params['TOOL_DIR'], "MuSEv0.9.8.6")):
-            raise Exception("Can't find MuSEv0.9.8.6")
+        if not os.path.exists(os.path.join(params['TOOL_DIR'], "muTect-1.1.5.jar")):
+            raise Exception("Can't find muTect-1.1.5.jar")
 
         if params['COSMIC_VCF'] is None:
             raise Exception("Missing COSMIC VCF")
@@ -91,8 +129,8 @@ class Mutect(MutCallerWrapper):
 class Muse(MutCallerWrapper):
     
     def check(self, params):
-        if not os.path.exists(os.path.join(params['TOOL_DIR'], "muTect-1.1.4.jar")):
-            raise Exception("Can't find muTect-1.1.4.jar")
+        if not os.path.exists(os.path.join(params['TOOL_DIR'], "MuSEv0.9.8.6")):
+            raise Exception("Can't find MuSEv0.9.8.6")
     
     def run_map(self, params):
         seq_map = {}
@@ -101,7 +139,7 @@ class Muse(MutCallerWrapper):
                 tmp = line.split("\t")
                 seq_map[tmp[0]] = long(tmp[1])
 
-        template = "${TOOL_DIR}/MuSEv0.9.8.6 call -P MuSEv0.9.8.6 -p 0.05 -b 0.0001 -B -f ${REF_SEQ} ${TUMOR_BAM} ${NORMAL_BAM} -l ${INTERVAL_FILE}"
+        template = "${TOOL_DIR}/MuSEv0.9.8.6 call -P varcall -p 0.05 -b 0.0001 -B -f ${REF_SEQ} ${TUMOR_BAM} ${NORMAL_BAM} -l ${INTERVAL_FILE}"
         
         counter = 0
         for seq in seq_map:
@@ -109,15 +147,22 @@ class Muse(MutCallerWrapper):
             for i in xrange(1, l, params['BLOCK_SIZE']):
                 interval="%s:%s-%s" % (seq, i, min(i+params['BLOCK_SIZE']-1, l))
                 interval_file = os.path.join(params['OUT_DIR'], "interval.%s" % (counter))
-                counter += 1
                 with open(interval_file, "w") as handle:
                     handle.write("%s\n" % interval) 
                 cmd = string.Template(template).substitute( dict(params, INTERVAL_FILE=interval_file ) )
-                yield (cmd, interval_file)
+                yield (cmd, "%s/varcall_interval.%s.MuSE.txt" % (params['OUT_DIR'], counter))
+                counter += 1
     
     def run_reduce(self,params, values):
         print "Reduce:", values
-        return None
+        
+        def r(block):
+            with open(os.path.join(params['OUT_DIR'], "out.MuSE.txt"), "w") as handle:
+                for a in values:
+                    with open(a) as inhandle:
+                        for line in inhandle:
+                            handle.write(line)       
+        return r
 
 method_callers = {
     'mutect' : Mutect,
